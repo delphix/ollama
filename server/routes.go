@@ -48,9 +48,16 @@ func experimentEnabled(name string) bool {
 	return slices.Contains(strings.Split(os.Getenv("OLLAMA_EXPERIMENT"), ","), name)
 }
 
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
 var useClient2 = experimentEnabled("client2")
 
-var mode string = gin.DebugMode
+var mode string = getEnvOrDefault("GIN_MODE", gin.DebugMode)
 
 type Server struct {
 	addr  net.Addr
