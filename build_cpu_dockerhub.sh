@@ -2,7 +2,7 @@
 set -eu
 
 # Set your organization and image name
-ORG=${ORG:-"arunskurian"}
+ORG=${ORG:-""}
 IMAGE_NAME=${IMAGE_NAME:-"ollama-cpu"}
 VERSION=${VERSION:-"latest"}
 
@@ -60,10 +60,12 @@ fi
 # Build and push/load the multi-arch image
 echo "Building for platforms: ${PLATFORMS}"
 docker buildx build \
+    --provenance=true \
+    --sbom=true \
     --network=host \
     ${LOAD_OR_PUSH} \
     --platform=${PLATFORMS} \
-    -f Dockerfile.cpu \
+    -f Dockerfile-cpu \
     -t ${ORG}/${IMAGE_NAME}:${VERSION} \
     .
 
