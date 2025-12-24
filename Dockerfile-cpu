@@ -43,7 +43,7 @@ RUN --mount=type=cache,target=/root/.ccache \
 
 
 FROM base AS build
-ARG GOVERSION=1.24.4
+ARG GOVERSION=1.25.5
 RUN curl -fsSL https://golang.org/dl/go${GOVERSION}.linux-$(case $(uname -m) in x86_64) echo amd64 ;; aarch64) echo arm64 ;; esac).tar.gz | tar xz -C /usr/local
 ENV PATH=/usr/local/go/bin:$PATH
 WORKDIR /go/src/github.com/ollama/ollama
@@ -75,9 +75,30 @@ COPY --from=build /bin/ollama /bin/ollama
 FROM ubuntu:24.04
 RUN apt-get update \
     && apt-get install -y ca-certificates curl openssl \
-    && apt-get install --only-upgrade -y libpam0g libpam-modules libpam-modules-bin libpam-runtime \
-    libsystemd0 libudev1 \
+    && apt-get upgrade -y \
+    && apt-get install --only-upgrade -y \
+       libpam0g libpam-modules libpam-modules-bin libpam-runtime \
+       libsystemd0 libudev1 systemd \
+       libcurl4t64 curl \
+       libc-bin libc6 \
+       libkrb5support0 libkrb5-3 \
+       libgnutls30t64 gnutls-bin \
+       passwd login \
+       tar \
+       # Targeted CVE patches
+       util-linux \
+       libcurl4t64 curl \
+       libc6 libc-bin \
     && update-ca-certificates \
+    # Force install latest security updates for specific CVE packages
+    && apt-get install --only-upgrade -y \
+       util-linux \
+       libgnutls30t64 \
+       libcurl4t64 \
+       curl \
+       libc6 \
+       libc-bin \
+    && apt-get autoremove -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=archive /bin /usr/bin
