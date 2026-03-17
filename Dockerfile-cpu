@@ -43,7 +43,7 @@ RUN --mount=type=cache,target=/root/.ccache \
 
 
 FROM base AS build
-ARG GOVERSION=1.25.5
+ARG GOVERSION=1.26.1
 RUN curl -fsSL https://golang.org/dl/go${GOVERSION}.linux-$(case $(uname -m) in x86_64) echo amd64 ;; aarch64) echo arm64 ;; esac).tar.gz | tar xz -C /usr/local
 ENV PATH=/usr/local/go/bin:$PATH
 WORKDIR /go/src/github.com/ollama/ollama
@@ -89,6 +89,7 @@ RUN apt-get update \
        util-linux \
        libcurl4t64 curl \
        libc6 libc-bin \
+       gpgv \
     && update-ca-certificates \
     # Force install latest security updates for specific CVE packages
     && apt-get install --only-upgrade -y \
@@ -98,6 +99,7 @@ RUN apt-get update \
        curl \
        libc6 \
        libc-bin \
+       gpgv \
     && apt-get autoremove -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*

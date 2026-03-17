@@ -1,6 +1,6 @@
 module github.com/ollama/ollama
 
-go 1.25.5
+go 1.26.1
 
 require (
 	github.com/containerd/console v1.0.3
