@@ -8,12 +8,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"maps"
 	"os"
 	"runtime"
 	"slices"
 	"strings"
 
+	"github.com/ollama/ollama/fs"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -245,7 +245,22 @@ func (llm *gguf) Decode(rs io.ReadSeeker) error {
 	padding := ggufPadding(offset, int64(alignment))
 	llm.tensorOffset = uint64(offset + padding)
 
+	// get file size to validate tensor bounds
+	fileSize, err := rs.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("failed to determine file size: %w", err)
+	}
+
+	if _, err := rs.Seek(offset, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to seek back after size check: %w", err)
+	}
+
 	for _, tensor := range llm.tensors {
+		tensorEnd := llm.tensorOffset + tensor.Offset + tensor.Size()
+		if tensorEnd > uint64(fileSize) {
+			return fmt.Errorf("tensor %q offset+size (%d) exceeds file size (%d)", tensor.Name, tensorEnd, fileSize)
+		}
+
 		offset, err := rs.Seek(0, io.SeekCurrent)
 		if err != nil {
 			return fmt.Errorf("failed to get current offset: %w", err)
@@ -305,7 +320,7 @@ func readGGUFV1StringsData(llm *gguf, r io.Reader, a *array[string]) (any, error
 
 			a.values[i] = e
 		} else {
-			discardGGUFString(llm, r)
+			_ = discardGGUFString(llm, r)
 		}
 	}
 
@@ -508,8 +523,11 @@ func writeGGUFArray[S ~[]E, E any](w io.Writer, t uint32, s S) error {
 	return binary.Write(w, binary.LittleEndian, s)
 }
 
-func WriteGGUF(f *os.File, kv KV, ts []*Tensor) error {
-	alignment := kv.Uint("general.alignment", 32)
+func WriteGGUF(f *os.File, kv fs.Config, ts []*Tensor) error {
+	arch := kv.String("general.architecture")
+	if arch == "" {
+		return fmt.Errorf("architecture not set")
+	}
 
 	if err := binary.Write(f, binary.LittleEndian, []byte("GGUF")); err != nil {
 		return err
@@ -523,12 +541,12 @@ func WriteGGUF(f *os.File, kv KV, ts []*Tensor) error {
 		return err
 	}
 
-	if err := binary.Write(f, binary.LittleEndian, uint64(len(kv))); err != nil {
+	if err := binary.Write(f, binary.LittleEndian, uint64(kv.Len())); err != nil {
 		return err
 	}
 
-	for _, key := range slices.Sorted(maps.Keys(kv)) {
-		if err := ggufWriteKV(f, key, kv[key]); err != nil {
+	for _, key := range slices.Sorted(kv.Keys()) {
+		if err := ggufWriteKV(f, arch, key, kv.Value(key)); err != nil {
 			return err
 		}
 	}
@@ -542,6 +560,8 @@ func WriteGGUF(f *os.File, kv KV, ts []*Tensor) error {
 			)
 		},
 	)
+
+	alignment := kv.Uint("general.alignment", 32)
 
 	var s uint64
 	for i := range ts {
@@ -563,7 +583,6 @@ func WriteGGUF(f *os.File, kv KV, ts []*Tensor) error {
 	g.SetLimit(runtime.GOMAXPROCS(0))
 	// TODO consider reducing if tensors size * gomaxprocs is larger than free memory
 	for _, t := range ts {
-		t := t
 		w := io.NewOffsetWriter(f, offset+int64(t.Offset))
 		g.Go(func() error {
 			_, err := t.WriteTo(w)
@@ -574,7 +593,14 @@ func WriteGGUF(f *os.File, kv KV, ts []*Tensor) error {
 	return g.Wait()
 }
 
-func ggufWriteKV(ws io.WriteSeeker, k string, v any) error {
+func ggufWriteKV(ws io.WriteSeeker, arch, k string, v any) error {
+	if !strings.HasPrefix(k, arch+".") &&
+		!strings.HasPrefix(k, "general.") &&
+		!strings.HasPrefix(k, "adapter.") &&
+		!strings.HasPrefix(k, "tokenizer.") {
+		k = arch + "." + k
+	}
+
 	slog.Debug(k, "type", fmt.Sprintf("%T", v))
 	if err := binary.Write(ws, binary.LittleEndian, uint64(len(k))); err != nil {
 		return err
@@ -586,6 +612,10 @@ func ggufWriteKV(ws io.WriteSeeker, k string, v any) error {
 
 	var err error
 	switch v := v.(type) {
+	case int32:
+		err = writeGGUF(ws, ggufTypeInt32, v)
+	case int64:
+		err = writeGGUF(ws, ggufTypeInt64, v)
 	case uint32, FileType:
 		err = writeGGUF(ws, ggufTypeUint32, v)
 	case uint64:
@@ -600,6 +630,10 @@ func ggufWriteKV(ws io.WriteSeeker, k string, v any) error {
 		err = writeGGUFArray(ws, ggufTypeInt32, v)
 	case *array[int32]:
 		err = writeGGUFArray(ws, ggufTypeInt32, v.values)
+	case []int64:
+		err = writeGGUFArray(ws, ggufTypeInt64, v)
+	case *array[int64]:
+		err = writeGGUFArray(ws, ggufTypeInt64, v.values)
 	case []uint32:
 		err = writeGGUFArray(ws, ggufTypeUint32, v)
 	case *array[uint32]:

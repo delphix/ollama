@@ -11,11 +11,12 @@ import (
 	"github.com/ollama/ollama/ml/nn"
 	"github.com/ollama/ollama/model"
 	"github.com/ollama/ollama/model/input"
+	"github.com/ollama/ollama/tokenizer"
 )
 
 type Model struct {
 	model.Base
-	model.BytePairEncoding
+	tokenizer.Tokenizer
 	ImageProcessor
 
 	*VisionModel `gguf:"v"`
@@ -33,8 +34,8 @@ func (p *Projector) Forward(ctx ml.Context, visionOutputs ml.Tensor) ml.Tensor {
 
 func New(c fs.Config) (model.Model, error) {
 	m := Model{
-		BytePairEncoding: model.NewBytePairEncoding(
-			&model.Vocabulary{
+		Tokenizer: tokenizer.NewBytePairEncoding(
+			&tokenizer.Vocabulary{
 				Values: c.Strings("tokenizer.ggml.tokens"),
 				Types:  c.Ints("tokenizer.ggml.token_type"),
 				Merges: c.Strings("tokenizer.ggml.merges"),
@@ -76,7 +77,7 @@ func (m *Model) EncodeMultimodal(ctx ml.Context, multimodalData []byte) ([]input
 		return nil, err
 	}
 
-	tilesLocal := ctx.Input().FromFloatSlice(pixelsLocal, size.X, size.Y, m.numChannels)
+	tilesLocal := ctx.Input().FromFloats(pixelsLocal, size.X, size.Y, m.numChannels)
 
 	ratioW, ratioH := size.X/m.imageSize, size.Y/m.imageSize
 
@@ -87,7 +88,7 @@ func (m *Model) EncodeMultimodal(ctx ml.Context, multimodalData []byte) ([]input
 	pixelValues := tilesLocal
 
 	if len(pixelsGlobal) > 0 {
-		tilesGlobal := ctx.Input().FromFloatSlice(pixelsGlobal, m.imageSize, m.imageSize, m.numChannels)
+		tilesGlobal := ctx.Input().FromFloats(pixelsGlobal, m.imageSize, m.imageSize, m.numChannels)
 		pixelValues = pixelValues.Concat(ctx, tilesGlobal, 3)
 	}
 
@@ -105,9 +106,7 @@ func (m *Model) EncodeMultimodal(ctx ml.Context, multimodalData []byte) ([]input
 
 		for range aspectRatio.Y {
 			for x := range aspectRatio.X {
-				view := projectedOutputs.View(ctx, projectedOutputs.Stride(1)*offset,
-					projectedOutputs.Dim(0), projectedOutputs.Stride(1),
-					patchesPerChunk)
+				view := projectedOutputs.Slice(ctx, 1, offset, offset+patchesPerChunk, 1)
 				var separator separator
 				if x < aspectRatio.X-1 {
 					separator.x = true // <|tile_x_separator|>
@@ -120,9 +119,7 @@ func (m *Model) EncodeMultimodal(ctx ml.Context, multimodalData []byte) ([]input
 		}
 	}
 
-	view := projectedOutputs.View(ctx, projectedOutputs.Stride(1)*offset,
-		projectedOutputs.Dim(0), projectedOutputs.Stride(1),
-		patchesPerChunk)
+	view := projectedOutputs.Slice(ctx, 1, offset, offset+patchesPerChunk, 1)
 	multimodal = append(multimodal, input.Multimodal{Tensor: view, Data: &separator{}})
 
 	return multimodal, nil
@@ -174,7 +171,7 @@ func (m *Model) PostTokenize(inputs []*input.Input) ([]*input.Input, error) {
 }
 
 func (m *Model) Forward(ctx ml.Context, batch input.Batch) (ml.Tensor, error) {
-	positions := ctx.Input().FromIntSlice(batch.Positions, len(batch.Positions))
+	positions := ctx.Input().FromInts(batch.Positions, len(batch.Positions))
 	return m.TextModel.Forward(ctx, batch.Inputs, positions, batch.Outputs, batch, m.Cache), nil
 }
 

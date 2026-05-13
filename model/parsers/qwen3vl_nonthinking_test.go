@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/ollama/ollama/api"
 )
 
@@ -198,7 +199,7 @@ func TestQwen3VLNonThinkingParserStreaming(t *testing.T) {
 
 		t.Run(tc.desc, func(t *testing.T) {
 			parser := Qwen3VLParser{hasThinkingSupport: false}
-			parser.Init([]api.Tool{}, nil)
+			parser.Init([]api.Tool{}, nil, nil)
 
 			for i, step := range tc.steps {
 				parser.buffer.WriteString(step.input)
@@ -214,6 +215,51 @@ func TestQwen3VLNonThinkingParserStreaming(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestQwen3VLNonThinkingAssignsSequentialToolCallIndices(t *testing.T) {
+	parser := Qwen3VLParser{hasThinkingSupport: false}
+	parser.Init([]api.Tool{}, nil, nil)
+
+	content, thinking, calls, err := parser.Add(
+		`<tool_call>{"name":"first","arguments":{"a":"1"}}</tool_call><tool_call>{"name":"second","arguments":{"b":"2"}}</tool_call>`,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+
+	if content != "" {
+		t.Fatalf("expected no content, got %q", content)
+	}
+	if thinking != "" {
+		t.Fatalf("expected no thinking, got %q", thinking)
+	}
+
+	expected := []api.ToolCall{
+		{
+			Function: api.ToolCallFunction{
+				Index: 0,
+				Name:  "first",
+				Arguments: testArgs(map[string]any{
+					"a": "1",
+				}),
+			},
+		},
+		{
+			Function: api.ToolCallFunction{
+				Index: 1,
+				Name:  "second",
+				Arguments: testArgs(map[string]any{
+					"b": "2",
+				}),
+			},
+		},
+	}
+
+	if diff := cmp.Diff(expected, calls, argsComparer); diff != "" {
+		t.Fatalf("tool calls mismatch (-want +got):\n%s", diff)
 	}
 }
 
@@ -515,7 +561,7 @@ func TestQwenOldParserStreaming(t *testing.T) {
 
 		t.Run(tc.desc, func(t *testing.T) {
 			parser := Qwen3VLParser{hasThinkingSupport: false}
-			parser.Init([]api.Tool{}, nil)
+			parser.Init([]api.Tool{}, nil, nil)
 
 			for i, step := range tc.steps {
 				parser.buffer.WriteString(step.input)
@@ -550,10 +596,10 @@ func TestQwen3VLNonThinkingToolParser(t *testing.T) {
 			wantToolCall: api.ToolCall{
 				Function: api.ToolCallFunction{
 					Name: "get-current-weather",
-					Arguments: map[string]any{
+					Arguments: testArgs(map[string]any{
 						"location": "San Francisco, CA",
 						"unit":     "fahrenheit",
-					},
+					}),
 				},
 			},
 		},
@@ -564,10 +610,10 @@ func TestQwen3VLNonThinkingToolParser(t *testing.T) {
 			wantToolCall: api.ToolCall{
 				Function: api.ToolCallFunction{
 					Name: "get current temperature",
-					Arguments: map[string]any{
+					Arguments: testArgs(map[string]any{
 						"location with spaces": "San Francisco",
 						"unit with spaces":     "celsius",
-					},
+					}),
 				},
 			},
 		},
@@ -578,10 +624,10 @@ func TestQwen3VLNonThinkingToolParser(t *testing.T) {
 			wantToolCall: api.ToolCall{
 				Function: api.ToolCallFunction{
 					Name: "\"get current temperature\"",
-					Arguments: map[string]any{
+					Arguments: testArgs(map[string]any{
 						"\"location with spaces\"": "San Francisco",
 						"\"unit with spaces\"":     "\"celsius\"",
-					},
+					}),
 				},
 			},
 		},
@@ -592,12 +638,12 @@ func TestQwen3VLNonThinkingToolParser(t *testing.T) {
 			wantToolCall: api.ToolCall{
 				Function: api.ToolCallFunction{
 					Name: "calculate",
-					Arguments: map[string]any{
+					Arguments: testArgs(map[string]any{
 						"x":       3.14,
 						"y":       float64(42),
 						"enabled": true,
 						"items":   []any{"a", "b", "c"},
-					},
+					}),
 				},
 			},
 		},
@@ -608,9 +654,9 @@ func TestQwen3VLNonThinkingToolParser(t *testing.T) {
 			wantToolCall: api.ToolCall{
 				Function: api.ToolCallFunction{
 					Name: "exec",
-					Arguments: map[string]any{
+					Arguments: testArgs(map[string]any{
 						"command": "ls && echo \"done\"",
-					},
+					}),
 				},
 			},
 		},
@@ -621,9 +667,9 @@ func TestQwen3VLNonThinkingToolParser(t *testing.T) {
 			wantToolCall: api.ToolCall{
 				Function: api.ToolCallFunction{
 					Name: "exec",
-					Arguments: map[string]any{
+					Arguments: testArgs(map[string]any{
 						"command": "ls && echo \"a > b and a < b\"",
-					},
+					}),
 				},
 			},
 		},
@@ -634,10 +680,10 @@ func TestQwen3VLNonThinkingToolParser(t *testing.T) {
 			wantToolCall: api.ToolCall{
 				Function: api.ToolCallFunction{
 					Name: "获取天气",
-					Arguments: map[string]any{
+					Arguments: testArgs(map[string]any{
 						"城市":      "北京",
 						"message": "Hello! 你好! 🌟 مرحبا",
-					},
+					}),
 				},
 			},
 		},
@@ -648,8 +694,194 @@ func TestQwen3VLNonThinkingToolParser(t *testing.T) {
 		if err != nil {
 			t.Errorf("step %d (%s): %v", i, step.name, err)
 		}
-		if !reflect.DeepEqual(gotToolCall, step.wantToolCall) {
+		if !toolCallEqual(gotToolCall, step.wantToolCall) {
 			t.Errorf("step %d (%s): got tool call %#v, want %#v", i, step.name, gotToolCall, step.wantToolCall)
 		}
+	}
+}
+
+func TestQwen3VLNonThinkingToolCallWhitespaceHandling(t *testing.T) {
+	type step struct {
+		input      string
+		wantEvents []qwenEvent
+	}
+
+	cases := []struct {
+		desc  string
+		steps []step
+		only  bool
+	}{
+		{
+			desc: "whitespace inside tool call preserves trailing space",
+			steps: []step{
+				{
+					input: "before<tool_call>   tool content   </tool_call>after",
+					wantEvents: []qwenEvent{
+						qwenEventContent{content: "before"},
+						qwenEventRawToolCall{raw: "   tool content   "},
+						qwenEventContent{content: "after"},
+					},
+				},
+			},
+		},
+		{
+			desc: "whitespace inside tool call preserves trailing space",
+			steps: []step{
+				{
+					input: "\n \n \n \n \n \n blahhhhhhhhhh blahhhh blahhhh \n\n\n\t\t     <tool_call>   tool content   </tool_call> \n\n\n\n\n\n\n after",
+					wantEvents: []qwenEvent{
+						qwenEventContent{content: "\n \n \n \n \n \n blahhhhhhhhhh blahhhh blahhhh"},
+						qwenEventRawToolCall{raw: "   tool content   "},
+						qwenEventContent{content: "after"},
+					},
+				},
+			},
+		},
+		{
+			desc: "whitespace inside tool call preserves trailing space",
+			steps: []step{
+				{
+					input: "<tool_call>   tool content   </tool_call>            ",
+					wantEvents: []qwenEvent{
+						qwenEventRawToolCall{raw: "   tool content   "},
+					},
+				},
+				{
+					input: "\n \n \n \n \n \n blahhhhhhhhhh blahhhh blahhhh \n\n\n\t\t     <tool_call>   anotha one   </tool_call> \n\n\n\n\n\n\n after \n\n\n\n\n\n blep",
+					wantEvents: []qwenEvent{
+						qwenEventContent{content: "blahhhhhhhhhh blahhhh blahhhh"},
+						qwenEventRawToolCall{raw: "   anotha one   "},
+						qwenEventContent{content: "after \n\n\n\n\n\n blep"},
+					},
+				},
+			},
+		},
+		{
+			desc: "whitespace between content and tool call",
+			steps: []step{
+				{
+					input: "content   \n  <tool_call>tool</tool_call>  \n  more content",
+					wantEvents: []qwenEvent{
+						qwenEventContent{content: "content"},
+						qwenEventRawToolCall{raw: "tool"},
+						qwenEventContent{content: "more content"},
+					},
+				},
+			},
+		},
+		{
+			desc: "consecutive tool calls with whitespace",
+			steps: []step{
+				{
+					input: "<tool_call>first</tool_call>  \n  <tool_call>second</tool_call>  \n  <tool_call>third</tool_call>",
+					wantEvents: []qwenEvent{
+						qwenEventRawToolCall{raw: "first"},
+						qwenEventRawToolCall{raw: "second"},
+						qwenEventRawToolCall{raw: "third"},
+					},
+				},
+			},
+		},
+		{
+			desc: "whitespace before and after tool open tag",
+			steps: []step{
+				{
+					input: "text   \n   <tool_call>content</tool_call>",
+					wantEvents: []qwenEvent{
+						qwenEventContent{content: "text"},
+						qwenEventRawToolCall{raw: "content"},
+					},
+				},
+			},
+		},
+		{
+			desc: "unicode whitespace around tool calls",
+			steps: []step{
+				{
+					input: "text\u00a0\u3000<tool_call>content</tool_call>\u00a0\u3000text",
+					wantEvents: []qwenEvent{
+						qwenEventContent{content: "text"},
+						qwenEventRawToolCall{raw: "content"},
+						qwenEventContent{content: "text"},
+					},
+				},
+			},
+		},
+		{
+			desc: "empty tool call with surrounding whitespace",
+			steps: []step{
+				{
+					input: "before  <tool_call></tool_call>  after",
+					wantEvents: []qwenEvent{
+						qwenEventContent{content: "before"},
+						qwenEventRawToolCall{raw: ""},
+						qwenEventContent{content: "after"},
+					},
+				},
+			},
+		},
+		{
+			desc: "whitespace in tool call split across chunks",
+			steps: []step{
+				{
+					input:      "before<tool_call>  ",
+					wantEvents: []qwenEvent{qwenEventContent{content: "before"}},
+				},
+				{
+					input:      "tool",
+					wantEvents: []qwenEvent{},
+				},
+				{
+					input: "  </tool_call>after",
+					wantEvents: []qwenEvent{
+						qwenEventRawToolCall{raw: "  tool  "},
+						qwenEventContent{content: "after"},
+					},
+				},
+			},
+		},
+		{
+			desc: "mixed whitespace types between tool calls",
+			steps: []step{
+				{
+					input: "<tool_call>first</tool_call> \t\n\r <tool_call>second</tool_call>",
+					wantEvents: []qwenEvent{
+						qwenEventRawToolCall{raw: "first"},
+						qwenEventRawToolCall{raw: "second"},
+					},
+				},
+			},
+		},
+	}
+
+	anyOnlies := false
+	for _, tc := range cases {
+		if tc.only {
+			anyOnlies = true
+		}
+	}
+
+	for _, tc := range cases {
+		if anyOnlies && !tc.only {
+			continue
+		}
+
+		t.Run(tc.desc, func(t *testing.T) {
+			parser := Qwen3VLParser{hasThinkingSupport: false}
+			parser.Init([]api.Tool{}, nil, nil)
+
+			for i, step := range tc.steps {
+				parser.buffer.WriteString(step.input)
+				gotEvents := parser.parseEvents()
+
+				if len(gotEvents) == 0 && len(step.wantEvents) == 0 {
+					continue
+				}
+
+				if !reflect.DeepEqual(gotEvents, step.wantEvents) {
+					t.Errorf("step %d: input %q: got events %#v, want %#v", i, step.input, gotEvents, step.wantEvents)
+				}
+			}
+		})
 	}
 }
