@@ -2,6 +2,7 @@ package discover
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,14 +11,23 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/ollama/ollama/format"
 )
 
 func GetCPUMem() (memInfo, error) {
+	mem, err := getCPUMem()
+	if err != nil {
+		return memInfo{}, err
+	}
+	return getCPUMemByCgroups(mem), nil
+}
+
+func getCPUMem() (memInfo, error) {
 	var mem memInfo
-	var total, available, free, buffers, cached, freeSwap uint64
+	var total, available, free, buffers, cached, freeSwap, reclaimableZfsArc uint64
 	f, err := os.Open("/proc/meminfo")
 	if err != nil {
 		return mem, err
@@ -48,12 +58,39 @@ func GetCPUMem() (memInfo, error) {
 	}
 	mem.TotalMemory = total * format.KibiByte
 	mem.FreeSwap = freeSwap * format.KibiByte
+	reclaimableZfsArc, err = GetZFSReclaimableMemory() // in bytes
 	if available > 0 {
-		mem.FreeMemory = available * format.KibiByte
+		mem.FreeMemory = available * format.KibiByte + reclaimableZfsArc
 	} else {
-		mem.FreeMemory = (free + buffers + cached) * format.KibiByte
+		mem.FreeMemory = (free + buffers + cached) * format.KibiByte + reclaimableZfsArc
 	}
 	return mem, nil
+}
+
+func getCPUMemByCgroups(mem memInfo) memInfo {
+	total, err := getUint64ValueFromFile("/sys/fs/cgroup/memory.max")
+	if err == nil {
+		mem.TotalMemory = total
+	}
+	used, err := getUint64ValueFromFile("/sys/fs/cgroup/memory.current")
+	if err == nil {
+		mem.FreeMemory = mem.TotalMemory - used
+	}
+	return mem
+}
+
+func getUint64ValueFromFile(path string) (uint64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		line := s.Text()
+		return strconv.ParseUint(line, 10, 64)
+	}
+	return 0, errors.New("empty file content")
 }
 
 const CpuInfoFilename = "/proc/cpuinfo"
@@ -74,7 +111,41 @@ func GetCPUDetails() []CPU {
 		return nil
 	}
 	defer file.Close()
-	return linuxCPUDetails(file)
+	cpus := linuxCPUDetails(file)
+	return overwriteThreadCountByLinuxCgroups(cpus)
+}
+
+func overwriteThreadCountByLinuxCgroups(cpus []CPU) []CPU {
+	file, err := os.Open("/sys/fs/cgroup/cpu.max")
+	if err != nil {
+		return cpus
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if sl := strings.Split(line, " "); len(sl) == 2 {
+			allowdUs, err := strconv.ParseInt(sl[0], 10, 64)
+			if err != nil {
+				slog.Warn("failed to parse CPU allowed micro secs", "error", err)
+				return cpus
+			}
+			unitUs, err := strconv.ParseInt(sl[1], 10, 64)
+			if err != nil {
+				slog.Warn("failed to parse CPU unit micro secs", "error", err)
+				return cpus
+			}
+
+			threads := int(max(allowdUs/unitUs, 1))
+
+			cpu := cpus[0]
+			cpu.CoreCount = threads
+			cpu.ThreadCount = threads
+			return []CPU{cpu}
+		}
+	}
+	return cpus
 }
 
 func linuxCPUDetails(file io.Reader) []CPU {
@@ -170,3 +241,56 @@ func IsNUMA() bool {
 	}
 	return len(ids) > 1
 }
+
+// GetZFSReclaimable returns max(0, size – c_min) from ZFS ARC stats.
+// Added to fix the arc memory cache issue on zfs
+// This will be a no-op is no zfs is involved.
+func GetZFSReclaimableMemory() (uint64, error) {
+        paths := []string{"/proc/spl/kstat/zfs/arcstats", "/proc/zfs/arcstats"}
+        var f *os.File
+        for _, path := range paths {
+                if file, err := os.Open(path); err == nil {
+                        f = file
+                        break
+                }
+        }
+        if f == nil {
+                return 0, nil
+        }
+        defer f.Close()
+
+        var size, cmin, reclaimable uint64
+        scanner := bufio.NewScanner(f)
+        for scanner.Scan() {
+                cols := strings.Fields(scanner.Text())
+                if len(cols) < 3 {
+                        continue
+                }
+                var err error
+                var val uint64
+
+                val, err = strconv.ParseUint(cols[2], 10, 64)
+                if err != nil {
+                        continue
+                }
+                switch cols[0] {
+                case "size":
+                        size = val
+                case "c_min":
+                        cmin = val
+                default:
+                        continue
+                }
+        }
+        if err := scanner.Err(); err != nil {
+                return 0, err
+        }
+        if size > cmin {
+                reclaimable = size - cmin
+        }
+        slog.Info("Checked amount of ZFS ARC cache is reclaimable", "bytes", reclaimable)
+        return reclaimable, nil
+}
+
+
+

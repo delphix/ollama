@@ -2,17 +2,17 @@ package gemma3
 
 import (
 	"github.com/ollama/ollama/fs"
-	"github.com/ollama/ollama/kvcache"
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/ml/nn"
 	"github.com/ollama/ollama/ml/nn/pooling"
 	"github.com/ollama/ollama/model"
 	"github.com/ollama/ollama/model/input"
+	"github.com/ollama/ollama/tokenizer"
 )
 
 type embedModel struct {
 	model.Base
-	model.SentencePiece
+	tokenizer.Tokenizer
 
 	*TextModel
 	poolingType pooling.Type
@@ -32,8 +32,8 @@ func (m *embedModel) Forward(ctx ml.Context, batch input.Batch) (ml.Tensor, erro
 
 func newEmbedModel(c fs.Config) (model.Model, error) {
 	m := &embedModel{
-		SentencePiece: model.NewSentencePiece(
-			&model.Vocabulary{
+		Tokenizer: tokenizer.NewSentencePiece(
+			&tokenizer.Vocabulary{
 				Values: c.Strings("tokenizer.ggml.tokens"),
 				Scores: c.Floats("tokenizer.ggml.scores"),
 				Types:  c.Ints("tokenizer.ggml.token_type"),
@@ -52,11 +52,6 @@ func newEmbedModel(c fs.Config) (model.Model, error) {
 		TextModel:   newTextModel(c),
 		poolingType: pooling.Type(c.Uint("pooling_type", 0)),
 	}
-
-	m.Cache = kvcache.NewWrapperCache(
-		kvcache.NewSWACache(int32(c.Uint("attention.sliding_window")), m.Shift),
-		kvcache.NewCausalCache(m.Shift),
-	)
 
 	return m, nil
 }

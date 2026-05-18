@@ -10,11 +10,12 @@ import (
 	"github.com/ollama/ollama/ml/nn/pooling"
 	"github.com/ollama/ollama/model"
 	"github.com/ollama/ollama/model/input"
+	"github.com/ollama/ollama/tokenizer"
 )
 
 type Model struct {
 	model.Base
-	model.TextProcessor
+	tokenizer.Tokenizer
 
 	TokenEmbedding     *nn.Embedding `gguf:"token_embd"`
 	TypeEmbedding      *nn.Embedding `gguf:"token_types"`
@@ -29,8 +30,8 @@ type Model struct {
 // Forward implements model.Model.
 func (m *Model) Forward(ctx ml.Context, batch input.Batch) (ml.Tensor, error) {
 	hiddenStates := m.TokenEmbedding.Forward(ctx, batch.Inputs)
-	hiddenStates = hiddenStates.Add(ctx, m.TypeEmbedding.Weight.View(ctx, 0, m.hiddenSize))
-	hiddenStates = hiddenStates.Add(ctx, m.PositionEmbedding.Forward(ctx, ctx.Input().FromIntSlice(batch.Positions, len(batch.Positions))))
+	hiddenStates = hiddenStates.Add(ctx, m.TypeEmbedding.Weight.Slice(ctx, 1, 0, 1, 1))
+	hiddenStates = hiddenStates.Add(ctx, m.PositionEmbedding.Forward(ctx, ctx.Input().FromInts(batch.Positions, len(batch.Positions))))
 	hiddenStates = m.TokenEmbeddingNorm.Forward(ctx, hiddenStates, m.eps)
 
 	for _, layer := range m.Layers {
@@ -129,41 +130,41 @@ func (o Options) headDim() int {
 }
 
 func New(c fs.Config) (model.Model, error) {
-	var processor model.TextProcessor
+	vocab := &tokenizer.Vocabulary{
+		Values: c.Strings("tokenizer.ggml.tokens"),
+		Scores: c.Floats("tokenizer.ggml.scores"),
+		Types:  c.Ints("tokenizer.ggml.token_type"),
+		AddBOS: c.Bool("tokenizer.ggml.add_bos_token", true),
+		BOS: []int32{
+			int32(cmp.Or(
+				c.Uint("tokenizer.ggml.cls_token_id"),
+				c.Uint("tokenizer.ggml.bos_token_id"),
+			)),
+		},
+		AddEOS: c.Bool("tokenizer.ggml.add_eos_token", true),
+		EOS: []int32{
+			int32(cmp.Or(
+				c.Uint("tokenizer.ggml.separator_token_id"),
+				//nolint:misspell
+				// NOTE: "seperator_token_id" is a typo in model metadata but we need to
+				// support it for compatibility.
+				c.Uint("tokenizer.ggml.seperator_token_id"),
+				c.Uint("tokenizer.ggml.eos_token_id"),
+			)),
+		},
+	}
+
+	var t tokenizer.Tokenizer
 	switch c.String("tokenizer.ggml.model", "bert") {
 	case "bert":
-		processor = model.NewWordPiece(
-			&model.Vocabulary{
-				Values: c.Strings("tokenizer.ggml.tokens"),
-				Scores: c.Floats("tokenizer.ggml.scores"),
-				Types:  c.Ints("tokenizer.ggml.token_type"),
-				AddBOS: c.Bool("tokenizer.ggml.add_bos_token", true),
-				BOS: []int32{
-					int32(cmp.Or(
-						c.Uint("tokenizer.ggml.cls_token_id"),
-						c.Uint("tokenizer.ggml.bos_token_id"),
-					)),
-				},
-				AddEOS: c.Bool("tokenizer.ggml.add_eos_token", true),
-				EOS: []int32{
-					int32(cmp.Or(
-						c.Uint("tokenizer.ggml.separator_token_id"),
-						//nolint:misspell
-						// NOTE: "seperator_token_id" is a typo in model metadata but we need to
-						// support it for compatibility.
-						c.Uint("tokenizer.ggml.seperator_token_id"),
-						c.Uint("tokenizer.ggml.eos_token_id"),
-					)),
-				},
-			},
-		)
+		t = tokenizer.NewWordPiece(vocab, true)
 	default:
 		return nil, model.ErrUnsupportedTokenizer
 	}
 
 	return &Model{
-		TextProcessor: processor,
-		Layers:        make([]EncoderLayer, c.Uint("block_count")),
+		Tokenizer: t,
+		Layers:    make([]EncoderLayer, c.Uint("block_count")),
 		Options: Options{
 			hiddenSize:  int(c.Uint("embedding_length")),
 			numHeads:    int(c.Uint("attention.head_count")),

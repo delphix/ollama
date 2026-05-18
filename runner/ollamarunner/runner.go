@@ -37,9 +37,16 @@ import (
 	"github.com/ollama/ollama/model/input"
 	"github.com/ollama/ollama/runner/common"
 	"github.com/ollama/ollama/sample"
+	"github.com/ollama/ollama/tokenizer"
 
 	_ "github.com/ollama/ollama/model/models"
 )
+
+// response contains a piece of generated text along with optional logprobs
+type response struct {
+	content  string
+	logprobs []llm.Logprob
+}
 
 type Sequence struct {
 	// ctxs are used for allocating tensors that last the lifetime of the sequence, such as
@@ -61,11 +68,14 @@ type Sequence struct {
 	// tokens that have been generated but not returned yet (e.g. for stop sequences)
 	pendingResponses []string
 
+	// logprobs for tokens that haven't been returned yet
+	pendingLogprobs []llm.Logprob
+
 	// input cache being used by this sequence
 	cache *InputCacheSlot
 
 	// channel to send responses over
-	responses chan string
+	responses chan response
 
 	// channel to stop decoding (such as if the remote connection is closed)
 	quit chan bool
@@ -93,6 +103,10 @@ type Sequence struct {
 
 	doneReason llm.DoneReason
 
+	// logprobs configuration
+	logprobs    bool
+	topLogprobs int
+
 	// Metrics
 	startedAt, lastUpdatedAt time.Time
 	processingDuration       time.Duration
@@ -102,13 +116,15 @@ type Sequence struct {
 }
 
 type NewSequenceParams struct {
-	numPredict int
-	stop       []string
-	numKeep    int32
-	sampler    sample.Sampler
-	embedding  bool
-	shift      bool
-	truncate   bool
+	numPredict  int
+	stop        []string
+	numKeep     int32
+	sampler     sample.Sampler
+	embedding   bool
+	shift       bool
+	truncate    bool
+	logprobs    bool
+	topLogprobs int
 }
 
 var errorInputTooLong = errors.New("the input length exceeds the context length")
@@ -131,11 +147,11 @@ func (s *Server) NewSequence(prompt string, images []llm.ImageData, params NewSe
 	params.numKeep = min(params.numKeep, s.cache.numCtx-1)
 
 	if int32(len(inputs)) > s.cache.numCtx {
-		discard := int32(len(inputs)) - s.cache.numCtx
-
 		if !params.truncate {
 			return nil, errorInputTooLong
 		}
+
+		discard := int32(len(inputs)) - s.cache.numCtx
 
 		promptStart := params.numKeep + discard
 
@@ -181,7 +197,7 @@ func (s *Server) NewSequence(prompt string, images []llm.ImageData, params NewSe
 		numPromptInputs:  len(inputs),
 		numPredict:       params.numPredict,
 		pendingResponses: make([]string, 0),
-		responses:        make(chan string, 100),
+		responses:        make(chan response, 100),
 		quit:             make(chan bool, 1),
 		embedding:        make(chan []float32, 1),
 		sampler:          params.sampler,
@@ -189,7 +205,18 @@ func (s *Server) NewSequence(prompt string, images []llm.ImageData, params NewSe
 		stop:             params.stop,
 		numKeep:          params.numKeep,
 		shift:            params.shift,
+		logprobs:         params.logprobs,
+		topLogprobs:      params.topLogprobs,
 	}, nil
+}
+
+// calculateLogprobs converts raw logits to log probabilities and finds top K tokens
+func calculateLogprobs(logits []float32, selectedToken int32, topK int, tok tokenizer.Tokenizer) []llm.Logprob {
+	decoder := func(tokenID int) string {
+		text, _ := tok.Decode([]int32{int32(tokenID)})
+		return text
+	}
+	return common.CalculateLogprobs(logits, int(selectedToken), topK, decoder)
 }
 
 // inputs processes the prompt and images into a list of inputs
@@ -214,10 +241,9 @@ func (s *Server) inputs(prompt string, images []llm.ImageData) ([]*input.Input, 
 		parts = []string{prompt}
 	}
 
-	postTokenize := false
 	for i, part := range parts {
 		// text - tokenize
-		tokens, err := s.model.(model.TextProcessor).Encode(part, i == 0)
+		tokens, err := s.model.(tokenizer.Tokenizer).Encode(part, i == 0)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -257,11 +283,10 @@ func (s *Server) inputs(prompt string, images []llm.ImageData) ([]*input.Input, 
 			mmStore.addMultimodal(imageEmbeddings)
 
 			inputs = append(inputs, &input.Input{Multimodal: imageEmbeddings, MultimodalHash: imageHash})
-			postTokenize = true
 		}
 	}
 
-	if visionModel && postTokenize {
+	if visionModel {
 		var err error
 		inputs, err = multimodalProcessor.PostTokenize(inputs)
 		if err != nil {
@@ -309,6 +334,13 @@ type Server struct {
 
 	// loadMu prevents more than one load attempt from occurring at a time
 	loadMu sync.Mutex
+
+	// infoInitialized caches the result of the dummy /info backend
+	// initialization. loadMu already serializes callers, so a simple cached
+	// result avoids repeated dummy loads without needing sync.Once.
+	infoInitialized bool
+	infoModel       model.Model
+	infoErr         error
 
 	// lastLoad is the load request from the previous load attempt. Used to
 	// detect if we can reuse an existing memory allocation.
@@ -373,7 +405,9 @@ func (s *Server) allNil() bool {
 
 func flushPending(seq *Sequence) bool {
 	joined := strings.Join(seq.pendingResponses, "")
+	logprobs := seq.pendingLogprobs
 	seq.pendingResponses = []string{}
+	seq.pendingLogprobs = []llm.Logprob{}
 
 	// Check if there are any partial UTF-8 characters remaining.
 	// We already check and queue as we are generating but some may
@@ -390,7 +424,7 @@ func flushPending(seq *Sequence) bool {
 	}
 
 	select {
-	case seq.responses <- joined:
+	case seq.responses <- response{content: joined, logprobs: logprobs}:
 		return true
 	case <-seq.quit:
 		return false
@@ -485,13 +519,6 @@ func (s *Server) forwardBatch(pendingBatch batchState) (nextBatch batchState, er
 		seqIdx = (seqIdx + 1) % len(s.seqs)
 		seq := s.seqs[seqIdx]
 		if seq == nil {
-			continue
-		}
-
-		// if past the num predict limit
-		if seq.numPredict > 0 && seq.numPredicted >= seq.numPredict {
-			s.removeSequence(seqIdx, llm.DoneReasonLength)
-			nextBatch.seqs[seqIdx] = nil
 			continue
 		}
 
@@ -599,7 +626,8 @@ func (s *Server) forwardBatch(pendingBatch batchState) (nextBatch batchState, er
 
 	// Actual batchInputs values will be injected into the batch.Inputs tensor before calling Compute
 	batch.Inputs = nextBatch.ctx.Input().Empty(ml.DTypeI32, len(batchInputs))
-	batch.Outputs = nextBatch.ctx.Input().FromIntSlice(batchOutputs, len(batchOutputs))
+	batch.Outputs = nextBatch.ctx.Input().FromInts(batchOutputs, len(batchOutputs))
+	nextBatch.ctx.SetBatchSize(len(batchInputs))
 	nextBatch.modelOutput, err = model.Forward(nextBatch.ctx, s.model, batch)
 	if err != nil {
 		err = fmt.Errorf("failed to build graph: %w", err)
@@ -682,7 +710,6 @@ func (s *Server) computeBatch(activeBatch batchState) {
 			continue
 		}
 
-		seq.numPredicted++
 		nextToken := &input.Input{Token: 0} // placeholder we'll fill in after Compute/Floats
 		seq.inputs = []*input.Input{nextToken}
 		nextBatchTokens[i] = nextToken
@@ -692,7 +719,7 @@ func (s *Server) computeBatch(activeBatch batchState) {
 	// At this point the seqs are ready for forwardBatch to move forward so unblock
 	s.mu.Unlock()
 
-	activeBatch.batch.Inputs.SetValueFromIntSlice(batchInputs)
+	activeBatch.batch.Inputs.FromInts(batchInputs)
 	activeBatch.ctx.ComputeWithNotify(
 		func() {
 			logutil.Trace("computeBatch: signaling computeStartedCh", "batchID", activeBatch.id)
@@ -713,8 +740,14 @@ func (s *Server) computeBatch(activeBatch batchState) {
 		if seq == nil || nextBatchTokens[i] == nil {
 			continue
 		}
+		// If the sequence was replaced while this batch was computing, discard results.
+		if activeBatch.seqs[i] != seq {
+			logutil.Trace("computeBatch: sequence replaced, discarding its results", "batchID", activeBatch.id, "seqIdx", i)
+			continue
+		}
 
 		seq.lastUpdatedAt = t
+		seq.numPredicted++
 		if seq.numPredicted == 1 {
 			seq.processingDuration = seq.lastUpdatedAt.Sub(seq.startedAt)
 			seq.startedAt = seq.lastUpdatedAt
@@ -730,7 +763,8 @@ func (s *Server) computeBatch(activeBatch batchState) {
 		// sample a token
 		vocabSize := len(outputs) / activeBatch.batch.Outputs.Dim(0)
 		logutil.Trace("computeBatch: vocab details", "batchID", activeBatch.id, "seqIdx", i, "len(logits)", len(outputs), "len(activeBatch.batch.Outputs)", activeBatch.batch.Outputs.Dim(0), "vocabSize", vocabSize, "iBatches", iBatches)
-		token, err := seq.sampler.Sample(outputs[iBatches[i]*vocabSize : (iBatches[i]+1)*vocabSize])
+		logits := outputs[iBatches[i]*vocabSize : (iBatches[i]+1)*vocabSize]
+		token, err := seq.sampler.Sample(logits)
 		if err != nil {
 			panic("failed to sample token")
 		}
@@ -738,7 +772,7 @@ func (s *Server) computeBatch(activeBatch batchState) {
 		nextBatchTokens[i].Token = token
 
 		// if it's an end of sequence token, break
-		if s.model.(model.TextProcessor).Is(token, model.SpecialEOS) {
+		if s.model.(tokenizer.Tokenizer).Is(token, tokenizer.SpecialEOS) {
 			// TODO (jmorganca): we should send this back
 			// as it's important for the /api/generate context
 			// seq.responses <- piece
@@ -747,12 +781,25 @@ func (s *Server) computeBatch(activeBatch batchState) {
 			continue
 		}
 
-		piece, err := s.model.(model.TextProcessor).Decode([]int32{token})
+		piece, err := s.model.(tokenizer.Tokenizer).Decode([]int32{token})
 		if err != nil {
 			panic("failed to decode token")
 		}
 
+		// Calculate logprobs if requested (after EOS check to avoid logprobs for EOS tokens)
+		if seq.logprobs {
+			logprobs := calculateLogprobs(logits, token, seq.topLogprobs, s.model.(tokenizer.Tokenizer))
+			seq.pendingLogprobs = append(seq.pendingLogprobs, logprobs...)
+		}
+
 		seq.pendingResponses = append(seq.pendingResponses, piece)
+
+		// if past the num predict limit
+		if seq.numPredict > 0 && seq.numPredicted >= seq.numPredict {
+			s.removeSequence(i, llm.DoneReasonLength)
+			continue
+		}
+
 		sequence := strings.Join(seq.pendingResponses, "")
 
 		if ok, stop := common.FindStop(sequence, seq.stop); ok {
@@ -762,6 +809,17 @@ func (s *Server) computeBatch(activeBatch batchState) {
 			origLen := len(seq.pendingResponses)
 			seq.pendingResponses, tokenTruncated = common.TruncateStop(seq.pendingResponses, stop)
 			newLen := len(seq.pendingResponses)
+
+			// Truncate logprobs to match the truncated responses
+			if seq.logprobs {
+				origLogprobsLen := len(seq.pendingLogprobs)
+				numTokensRemoved := origLen - newLen
+				newLogprobsLen := origLogprobsLen - numTokensRemoved
+				if newLogprobsLen < 0 {
+					newLogprobsLen = 0
+				}
+				seq.pendingLogprobs = seq.pendingLogprobs[:newLogprobsLen]
+			}
 
 			// Update the cache based on the tokens that will be returned:
 			// - We have 1 token more than is currently in the cache because
@@ -828,7 +886,7 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 	var grammar *sample.GrammarSampler
 	var err error
 	if req.Grammar != "" {
-		grammar, err = sample.NewGrammarSampler(s.model.(model.TextProcessor), req.Grammar)
+		grammar, err = sample.NewGrammarSampler(s.model.(tokenizer.Tokenizer), req.Grammar)
 		if err != nil {
 			http.Error(w, "failed to load model vocabulary required for format", http.StatusInternalServerError)
 			return
@@ -846,13 +904,15 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 	)
 
 	seq, err := s.NewSequence(req.Prompt, req.Images, NewSequenceParams{
-		numPredict: req.Options.NumPredict,
-		stop:       req.Options.Stop,
-		numKeep:    int32(req.Options.NumKeep),
-		sampler:    sampler,
-		embedding:  false,
-		shift:      req.Shift,
-		truncate:   req.Truncate,
+		numPredict:  req.Options.NumPredict,
+		stop:        req.Options.Stop,
+		numKeep:     int32(req.Options.NumKeep),
+		sampler:     sampler,
+		embedding:   false,
+		shift:       req.Shift,
+		truncate:    req.Truncate,
+		logprobs:    req.Logprobs,
+		topLogprobs: req.TopLogprobs,
 	})
 	if err != nil {
 		if errors.Is(err, errorInputTooLong) {
@@ -904,10 +964,11 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			close(seq.quit)
 			return
-		case content, ok := <-seq.responses:
+		case resp, ok := <-seq.responses:
 			if ok {
 				if err := json.NewEncoder(w).Encode(&llm.CompletionResponse{
-					Content: content,
+					Content:  resp.content,
+					Logprobs: resp.logprobs,
 				}); err != nil {
 					http.Error(w, fmt.Sprintf("failed to encode response: %v", err), http.StatusInternalServerError)
 					close(seq.quit)
@@ -946,8 +1007,15 @@ func (s *Server) embeddings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	seq, err := s.NewSequence(req.Content, nil, NewSequenceParams{embedding: true})
+	seq, err := s.NewSequence(req.Content, nil, NewSequenceParams{
+		embedding: true,
+		truncate:  false,
+	})
 	if err != nil {
+		if errors.Is(err, errorInputTooLong) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		http.Error(w, fmt.Sprintf("failed to create new sequence: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -988,7 +1056,8 @@ func (s *Server) embeddings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.NewEncoder(w).Encode(&llm.EmbeddingResponse{
-		Embedding: <-seq.embedding,
+		Embedding:       <-seq.embedding,
+		PromptEvalCount: seq.numPromptInputs,
 	}); err != nil {
 		http.Error(w, fmt.Sprintf("failed to encode response: %v", err), http.StatusInternalServerError)
 	}
@@ -1004,12 +1073,17 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) reserveWorstCaseGraph() error {
+func (s *Server) reserveWorstCaseGraph(prompt bool) error {
 	ctx := s.model.Backend().NewContext()
 	defer ctx.Close()
 
 	var err error
-	inputs := make([]*input.Input, s.batchSize)
+	batchSize := 1
+	if prompt {
+		batchSize = s.batchSize
+	}
+
+	inputs := make([]*input.Input, batchSize)
 	for i := range inputs {
 		inputs[i] = &input.Input{}
 	}
@@ -1026,7 +1100,7 @@ func (s *Server) reserveWorstCaseGraph() error {
 	// - The result may now be larger than a batch (images may not fit in a
 	//   single batch), so trim based on what will fit and must be grouped together.
 	// - Fill out the rest of the space with text tokens.
-	if multimodalProcessor, ok := s.model.(model.MultimodalProcessor); ok {
+	if multimodalProcessor, ok := s.model.(model.MultimodalProcessor); prompt && ok {
 		mmCtx := s.model.Backend().NewContext()
 		defer mmCtx.Close()
 
@@ -1053,10 +1127,10 @@ func (s *Server) reserveWorstCaseGraph() error {
 				}
 			}
 
-			if len(inputs) < s.batchSize {
-				newInputs := make([]*input.Input, s.batchSize)
+			if len(inputs) < batchSize {
+				newInputs := make([]*input.Input, batchSize)
 				copy(newInputs, inputs)
-				for i := len(inputs); i < s.batchSize; i++ {
+				for i := len(inputs); i < batchSize; i++ {
 					newInputs[i] = &input.Input{}
 				}
 				inputs = newInputs
@@ -1082,7 +1156,7 @@ func (s *Server) reserveWorstCaseGraph() error {
 		batch.Positions[i] = int32(i)
 	}
 
-	batch.Inputs = ctx.Input().FromIntSlice(batchInputs, len(batchInputs))
+	batch.Inputs = ctx.Input().FromInts(batchInputs, len(batchInputs))
 	batch.Outputs = ctx.Input().Empty(ml.DTypeI32, s.parallel)
 
 	cache := s.model.Config().Cache
@@ -1098,6 +1172,7 @@ func (s *Server) reserveWorstCaseGraph() error {
 		return err
 	}
 
+	ctx.SetBatchSize(batchSize)
 	ctx.Forward(t).Reserve()
 
 	return nil
@@ -1141,21 +1216,32 @@ func (s *Server) allocModel(
 		return errors.New("loras are not yet implemented")
 	}
 
+	if s.model.Config().Cache == nil {
+		if parallel > 1 {
+			parallel = 1
+			slog.Warn("model does not support caching, disabling parallel processing")
+		}
+		if s.batchSize < kvSize {
+			s.batchSize = kvSize
+			slog.Warn("model does not support caching, setting batch size to context length", "batch_size", kvSize)
+		}
+	}
+
 	s.cache, err = NewInputCache(s.model, kvCacheType, int32(kvSize), parallel, s.batchSize, multiUserCache)
 	if err != nil {
 		return err
-	}
-
-	if !s.cache.enabled && parallel > 1 {
-		parallel = 1
-		slog.Warn("model does not support caching, disabling parallel processing")
 	}
 
 	s.parallel = parallel
 	s.seqs = make([]*Sequence, s.parallel)
 	s.seqsSem = semaphore.NewWeighted(int64(s.parallel))
 
-	return s.reserveWorstCaseGraph()
+	err = s.reserveWorstCaseGraph(true)
+	if err != nil {
+		return err
+	}
+
+	return s.reserveWorstCaseGraph(false)
 }
 
 // closeModel frees all memory associated with a model
@@ -1177,6 +1263,12 @@ func (s *Server) loadModel() {
 		})
 	if err != nil {
 		panic(fmt.Errorf("failed to load model: %v", err))
+	}
+
+	if postLoader, ok := s.model.(model.PostLoader); ok {
+		if err := postLoader.PostLoad(); err != nil {
+			panic(fmt.Errorf("failed to finalize model initialization: %v", err))
+		}
 	}
 
 	s.status = llm.ServerStatusReady
@@ -1277,42 +1369,68 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 
-	m := s.model
-
-	if m == nil {
-		startLoad := time.Now()
-
-		// Dummy load to get the backend wired up
-		f, err := os.CreateTemp("", "*.bin")
-		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to initialize baackend: %v", err), http.StatusInternalServerError)
-			return
-		}
-		defer f.Close()
-		defer os.Remove(f.Name())
-
-		if err := ggml.WriteGGUF(f, ggml.KV{
-			"general.architecture": "llama",
-			"tokenizer.ggml.model": "gpt2",
-		}, nil); err != nil {
-			http.Error(w, fmt.Sprintf("failed to initialize baackend: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		m, err = model.New(f.Name(), ml.BackendParams{NumThreads: runtime.NumCPU(), AllocMemory: false, GPULayers: ml.GPULayersList{{}}})
-		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to initialize baackend: %v", err), http.StatusInternalServerError)
-			return
-		}
-		slog.Debug("dummy model load took", "duration", time.Since(startLoad))
+	m, err := s.infoModelLocked()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to initialize backend: %v", err), http.StatusInternalServerError)
+		return
 	}
-
 	startDevices := time.Now()
 	infos := m.Backend().BackendDevices()
 	slog.Debug("gathering device infos took", "duration", time.Since(startDevices))
 	if err := json.NewEncoder(w).Encode(&infos); err != nil {
 		http.Error(w, fmt.Sprintf("failed to encode response: %v", err), http.StatusInternalServerError)
+		return
 	}
+}
+
+func (s *Server) infoModelLocked() (model.Model, error) {
+	if s.model != nil {
+		return s.model, nil
+	}
+
+	if !s.infoInitialized {
+		s.infoInitialized = true
+
+		func() {
+			startLoad := time.Now()
+			defer func() {
+				if rec := recover(); rec != nil {
+					s.infoErr = fmt.Errorf("panic during dummy backend initialization: %v", rec)
+				}
+			}()
+
+			// Dummy load to get the backend wired up.
+			f, err := os.CreateTemp("", "*.bin")
+			if err != nil {
+				s.infoErr = err
+				return
+			}
+			defer f.Close()
+			defer os.Remove(f.Name())
+
+			if err := ggml.WriteGGUF(f, ggml.KV{
+				"general.architecture": "llama",
+				"tokenizer.ggml.model": "gpt2",
+			}, nil); err != nil {
+				s.infoErr = err
+				return
+			}
+
+			s.infoModel, s.infoErr = model.New(f.Name(), ml.BackendParams{NumThreads: runtime.NumCPU(), AllocMemory: false, GPULayers: ml.GPULayersList{{}}})
+			if s.infoErr == nil {
+				slog.Debug("dummy model load took", "duration", time.Since(startLoad))
+			}
+		}()
+	}
+
+	if s.infoErr != nil {
+		return nil, s.infoErr
+	}
+	if s.infoModel == nil {
+		return nil, fmt.Errorf("dummy backend initialization did not produce a model")
+	}
+
+	return s.infoModel, nil
 }
 
 func Execute(args []string) error {

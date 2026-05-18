@@ -3,15 +3,16 @@ package qwen3
 import (
 	"cmp"
 	"math"
+	"strings"
 
 	"github.com/ollama/ollama/fs"
 	"github.com/ollama/ollama/kvcache"
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/ml/nn"
-	"github.com/ollama/ollama/ml/nn/fast"
 	"github.com/ollama/ollama/ml/nn/rope"
 	"github.com/ollama/ollama/model"
 	"github.com/ollama/ollama/model/input"
+	"github.com/ollama/ollama/tokenizer"
 )
 
 type Options struct {
@@ -45,7 +46,7 @@ func (o Options) applyRotaryPositionEmbeddings(ctx ml.Context, states, positions
 			rope.WithAttentionFactor(attnFactor),
 		)
 	}
-	return fast.RoPE(ctx, states, positions, o.headDim(), o.ropeBase, 1./o.ropeScale, opts...)
+	return nn.RoPE(ctx, states, positions, o.headDim(), o.ropeBase, 1./o.ropeScale, opts...)
 }
 
 type Attention struct {
@@ -159,7 +160,7 @@ func (d *Layer) Forward(ctx ml.Context, hiddenStates, positions, outputs ml.Tens
 
 type Model struct {
 	model.Base
-	model.BytePairEncoding
+	tokenizer.Tokenizer
 
 	TokenEmbedding *nn.Embedding `gguf:"token_embd"`
 	OutputNorm     *nn.RMSNorm   `gguf:"output_norm"`
@@ -181,7 +182,7 @@ func (m *Model) Forward(ctx ml.Context, batch input.Batch) (ml.Tensor, error) {
 
 // Forward implements model.Model.
 func (m *Model) forward(ctx ml.Context, batch input.Batch) (ml.Tensor, error) {
-	positions := ctx.Input().FromIntSlice(batch.Positions, len(batch.Positions))
+	positions := ctx.Input().FromInts(batch.Positions, len(batch.Positions))
 
 	hiddenStates := m.TokenEmbedding.Forward(ctx, batch.Inputs)
 
@@ -210,7 +211,7 @@ var _ model.Model = (*Model)(nil)
 func New(c fs.Config) (model.Model, error) {
 	layers := make([]Layer, c.Uint("block_count"))
 	for i := range layers {
-		if c.String("general.architecture") == "qwen3moe" {
+		if strings.HasSuffix(c.String("general.architecture"), "moe") {
 			layers[i].MLP = &sparse{}
 		} else {
 			layers[i].MLP = &dense{}
@@ -218,8 +219,8 @@ func New(c fs.Config) (model.Model, error) {
 	}
 
 	m := Model{
-		BytePairEncoding: model.NewBytePairEncoding(
-			&model.Vocabulary{
+		Tokenizer: tokenizer.NewBytePairEncoding(
+			&tokenizer.Vocabulary{
 				Values: c.Strings("tokenizer.ggml.tokens"),
 				Types:  c.Ints("tokenizer.ggml.token_type"),
 				Merges: c.Strings("tokenizer.ggml.merges"),

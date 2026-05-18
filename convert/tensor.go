@@ -2,10 +2,13 @@ package convert
 
 import (
 	"cmp"
+	"errors"
 	"io"
 	"iter"
+	"maps"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/pdevine/tensor"
@@ -19,8 +22,8 @@ type split struct {
 	dim    int
 	slices []tensor.Slice
 
-	// fn is an optional function to apply to the tensor after slicing
-	fn func(tensor.Tensor) (tensor.Tensor, error)
+	// afterFunc is an optional function to apply to the tensor after slicing
+	afterFunc func(tensor.Tensor) (tensor.Tensor, error)
 }
 
 // splitDim splits a tensor along a specified dimension into multiple tensors. The dimension
@@ -54,8 +57,8 @@ func splitDim(t Tensor, dim int, splits ...split) iter.Seq[*ggml.Tensor] {
 
 				tt = tensor.Materialize(tt)
 
-				if split.fn != nil {
-					tt, err = split.fn(tt)
+				if split.afterFunc != nil {
+					tt, err = split.afterFunc(tt)
 					if err != nil {
 						return nil, err
 					}
@@ -94,6 +97,26 @@ func mergeTensors(unmatched []Tensor, merges ...merge) (out []*ggml.Tensor, _ []
 			return matched
 		})
 
+		slices.SortStableFunc(matched, func(a, b Tensor) int {
+			x := strings.Split(a.Name(), ".")
+			y := strings.Split(b.Name(), ".")
+			if len(x) != len(y) {
+				return cmp.Compare(len(x), len(y))
+			}
+
+			vals := make([]int, len(x))
+			for i := range x {
+				vals[i] = strings.Compare(x[i], y[i])
+				m, err := strconv.ParseInt(x[i], 0, 0)
+				n, err2 := strconv.ParseInt(y[i], 0, 0)
+				if errors.Join(err, err2) == nil {
+					vals[i] = cmp.Compare(m, n)
+				}
+			}
+
+			return cmp.Or(vals...)
+		})
+
 		if len(matched) > 0 {
 			out = append(out, &ggml.Tensor{
 				Name:     merges[i].name,
@@ -130,4 +153,55 @@ func (g mergeGroup) WriteTo(w io.Writer) (int64, error) {
 	}
 
 	return 0, nil
+}
+
+func sourceTensorKV(ts []*ggml.Tensor) KV {
+	sourceFP8 := make(map[string]struct{})
+	for _, t := range ts {
+		if writerSourceDType(t.WriterTo) == "F8_E4M3" {
+			sourceFP8[t.Name] = struct{}{}
+		}
+	}
+	if len(sourceFP8) == 0 {
+		return nil
+	}
+
+	return KV{
+		"source_quantization": "hf_fp8",
+		"source_fp8_tensors":  slices.Sorted(maps.Keys(sourceFP8)),
+	}
+}
+
+type sourceDTypeTensor interface {
+	SourceDType() string
+}
+
+func writerSourceDType(w io.WriterTo) string {
+	switch w := w.(type) {
+	case sourceDTypeTensor:
+		return w.SourceDType()
+	case mergeGroup:
+		if len(w) == 0 {
+			return ""
+		}
+		dtype := sourceDType(w[0])
+		if dtype == "" {
+			return ""
+		}
+		for _, t := range w[1:] {
+			if sourceDType(t) != dtype {
+				return ""
+			}
+		}
+		return dtype
+	default:
+		return ""
+	}
+}
+
+func sourceDType(t Tensor) string {
+	if t, ok := t.(sourceDTypeTensor); ok {
+		return t.SourceDType()
+	}
+	return ""
 }

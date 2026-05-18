@@ -9,11 +9,12 @@ import (
 
 func TestQwen3VLNonThinkingRenderer(t *testing.T) {
 	tests := []struct {
-		name     string
-		msgs     []api.Message
-		images   []api.ImageData
-		tools    []api.Tool
-		expected string
+		name       string
+		msgs       []api.Message
+		images     []api.ImageData
+		tools      []api.Tool
+		useImgTags bool
+		expected   string
 	}{
 		{
 			name: "prefill",
@@ -93,6 +94,18 @@ I'll check the weather in San Francisco for you.<think>Speak poetry after the fi
 Let me analyze this image.`,
 		},
 		{
+			name: "Image with image tags",
+			msgs: []api.Message{
+				{Role: "user", Content: "Describe this image.", Images: []api.ImageData{api.ImageData("img2")}},
+				{Role: "assistant", Content: "Let me analyze this image."},
+			},
+			useImgTags: true,
+			expected: `<|im_start|>user
+[img-0] Describe this image.<|im_end|>
+<|im_start|>assistant
+Let me analyze this image.`,
+		},
+		{
 			name: "Multiple images",
 			msgs: []api.Message{
 				{Role: "user", Content: "Describe these images.", Images: []api.ImageData{api.ImageData("img1"), api.ImageData("img2")}},
@@ -102,7 +115,18 @@ Let me analyze this image.`,
 <|im_start|>assistant
 `,
 		},
-
+		{
+			name: "Multiple images with image tags",
+			msgs: []api.Message{
+				{Role: "user", Content: "Describe these images.", Images: []api.ImageData{api.ImageData("img1"), api.ImageData("img2")}},
+				{Role: "assistant", Content: "Let me analyze this image."},
+			},
+			useImgTags: true,
+			expected: `<|im_start|>user
+[img-0][img-1] Describe these images.<|im_end|>
+<|im_start|>assistant
+Let me analyze this image.`,
+		},
 		// 		// NOTE: solved with #12518: https://github.com/ollama/ollama/compare/main...drifkin/stable-tool-args
 		// 		{
 		// 			name: "with tools and response",
@@ -313,7 +337,7 @@ Let me analyze this image.`,
 					Role:    "assistant",
 					Content: "I'll check.",
 					ToolCalls: []api.ToolCall{
-						{Function: api.ToolCallFunction{Name: "get-current-weather", Arguments: map[string]any{"location": "Paris", "unit": "celsius"}}},
+						{Function: api.ToolCallFunction{Name: "get-current-weather", Arguments: testArgsOrdered([]orderedArg{{"location", "Paris"}, {"unit", "celsius"}})}},
 					},
 				},
 				{Role: "user", Content: "<tool_response>\n18\n</tool_response>"},
@@ -343,8 +367,8 @@ Thanks!<|im_end|>
 					Role:    "assistant",
 					Content: "before",
 					ToolCalls: []api.ToolCall{
-						{Function: api.ToolCallFunction{Name: "add", Arguments: map[string]any{"a": 2, "b": 3}}},
-						{Function: api.ToolCallFunction{Name: "mul", Arguments: map[string]any{"x": 4, "y": 5}}},
+						{Function: api.ToolCallFunction{Name: "add", Arguments: testArgsOrdered([]orderedArg{{"a", 2}, {"b", 3}})}},
+						{Function: api.ToolCallFunction{Name: "mul", Arguments: testArgsOrdered([]orderedArg{{"x", 4}, {"y", 5}})}},
 					},
 				},
 			},
@@ -363,7 +387,7 @@ before
 			name: "consecutive tool responses grouped",
 			msgs: []api.Message{
 				{Role: "user", Content: "Compute results"},
-				{Role: "assistant", Content: "ok", ToolCalls: []api.ToolCall{{Function: api.ToolCallFunction{Name: "job", Arguments: map[string]any{"n": 1}}}}},
+				{Role: "assistant", Content: "ok", ToolCalls: []api.ToolCall{{Function: api.ToolCallFunction{Name: "job", Arguments: testArgs(map[string]any{"n": 1})}}}},
 				{Role: "tool", Content: "5", ToolName: "job"},
 				{Role: "tool", Content: "6", ToolName: "job"},
 			},
@@ -388,7 +412,7 @@ ok
 			name: "last message is tool then prefill",
 			msgs: []api.Message{
 				{Role: "user", Content: "run"},
-				{Role: "assistant", Content: "ok", ToolCalls: []api.ToolCall{{Function: api.ToolCallFunction{Name: "exec", Arguments: map[string]any{"cmd": "ls"}}}}},
+				{Role: "assistant", Content: "ok", ToolCalls: []api.ToolCall{{Function: api.ToolCallFunction{Name: "exec", Arguments: testArgs(map[string]any{"cmd": "ls"})}}}},
 				{Role: "tool", Content: "done", ToolName: "exec"},
 			},
 			expected: `<|im_start|>user
@@ -423,7 +447,7 @@ done
 					Role:    "assistant",
 					Content: "I'll check.",
 					ToolCalls: []api.ToolCall{
-						{Function: api.ToolCallFunction{Name: "get-current-weather", Arguments: map[string]any{"location": "Paris", "unit": "celsius"}}},
+						{Function: api.ToolCallFunction{Name: "get-current-weather", Arguments: testArgsOrdered([]orderedArg{{"location", "Paris"}, {"unit", "celsius"}})}},
 					},
 				},
 				{Role: "user", Content: "<tool_response>\n18\n</tool_response>"},
@@ -453,7 +477,7 @@ Thanks!<|im_end|>
 					Role:    "assistant",
 					Content: "I'll check.",
 					ToolCalls: []api.ToolCall{
-						{Function: api.ToolCallFunction{Name: "get-current-weather", Arguments: map[string]any{"location": "Paris", "unit": "celsius"}}},
+						{Function: api.ToolCallFunction{Name: "get-current-weather", Arguments: testArgsOrdered([]orderedArg{{"location", "Paris"}, {"unit", "celsius"}})}},
 					},
 				},
 				{Role: "user", Content: "\n\n\n\n<tool_response>\n18\n</tool_response> extra\n\n\n\n\n\n"},
@@ -485,7 +509,7 @@ I'll check.
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			rendered, err := (&Qwen3VLRenderer{false}).Render(tt.msgs, tt.tools, nil)
+			rendered, err := (&Qwen3VLRenderer{isThinking: false, useImgTags: tt.useImgTags}).Render(tt.msgs, tt.tools, nil)
 			if err != nil {
 				t.Fatal(err)
 			}

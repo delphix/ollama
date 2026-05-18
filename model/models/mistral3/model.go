@@ -11,11 +11,12 @@ import (
 	"github.com/ollama/ollama/ml/nn"
 	"github.com/ollama/ollama/model"
 	"github.com/ollama/ollama/model/input"
+	"github.com/ollama/ollama/tokenizer"
 )
 
 type Model struct {
 	model.Base
-	model.BytePairEncoding
+	tokenizer.Tokenizer
 
 	*TextModel
 	*VisionModel         `gguf:"v"`
@@ -28,12 +29,12 @@ type Model struct {
 var _ model.MultimodalProcessor = (*Model)(nil)
 
 // Implement TextProcessor interface
-var _ model.TextProcessor = (*Model)(nil)
+var _ tokenizer.Tokenizer = (*Model)(nil)
 
 func New(c fs.Config) (model.Model, error) {
 	m := &Model{
-		BytePairEncoding: model.NewBytePairEncoding(
-			&model.Vocabulary{
+		Tokenizer: tokenizer.NewBytePairEncoding(
+			&tokenizer.Vocabulary{
 				Values: c.Strings("tokenizer.ggml.tokens"),
 				Types:  c.Ints("tokenizer.ggml.token_type"),
 				Merges: c.Strings("tokenizer.ggml.merges"),
@@ -114,7 +115,7 @@ func (m *Model) EncodeMultimodal(ctx ml.Context, multimodalData []byte) ([]input
 		return nil, err
 	}
 
-	pixelValues := ctx.Input().FromFloatSlice(f32s, size.X, size.Y, m.ImageProcessor.numChannels)
+	pixelValues := ctx.Input().FromFloats(f32s, size.X, size.Y, m.ImageProcessor.numChannels)
 
 	visionOutputs := m.VisionModel.Forward(ctx, pixelValues)
 	features, size := m.MultiModalProjector.Forward(ctx, visionOutputs, size)
@@ -158,9 +159,10 @@ func (m *Model) PostTokenize(inputs []*input.Input) ([]*input.Input, error) {
 }
 
 func (m *Model) Forward(ctx ml.Context, batch input.Batch) (ml.Tensor, error) {
-	positions := ctx.Input().FromIntSlice(batch.Positions, len(batch.Positions))
+	positions := ctx.Input().FromInts(batch.Positions, len(batch.Positions))
+	positionsScale := m.getScale(ctx, batch.Positions)
 
-	return m.TextModel.Forward(ctx, batch.Inputs, positions, batch.Outputs, batch, m.Cache), nil
+	return m.TextModel.Forward(ctx, batch.Inputs, positions, positionsScale, batch.Outputs, batch, m.Cache), nil
 }
 
 func init() {
