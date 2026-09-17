@@ -80,7 +80,7 @@ require (
 
 require (
 	github.com/bytedance/sonic v1.11.6 // indirect
-	github.com/dlclark/regexp2/v2 v2.7.1
+	github.com/dlclark/regexp2/v2 v2.8.0
 	github.com/gabriel-vasile/mimetype v1.4.3 // indirect
 	github.com/gin-contrib/cors v1.7.2
 	github.com/gin-contrib/sse v0.1.0 // indirect
