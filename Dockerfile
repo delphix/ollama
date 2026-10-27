@@ -216,6 +216,11 @@ ARG APT_MIRROR=http://archive.ubuntu.com/ubuntu
 RUN sed -i "s|http://archive.ubuntu.com/ubuntu|$APT_MIRROR|g" /etc/apt/sources.list.d/ubuntu.sources \
     && apt-get update \
     && apt-get install -y ca-certificates libvulkan1 libopenblas0 \
+    # Targeted CVE patches
+    && apt-get install --only-upgrade -y \
+       attr \
+       gnupg2 \
+       zlib1g \
     && sed -i "s|$APT_MIRROR|http://archive.ubuntu.com/ubuntu|g" /etc/apt/sources.list.d/ubuntu.sources \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*

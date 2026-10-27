@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/dlclark/regexp2"
+	"github.com/dlclark/regexp2/v2"
 	heap "github.com/emirpasic/gods/v2/trees/binaryheap"
 	"github.com/ollama/ollama/logutil"
 )
@@ -83,8 +83,8 @@ func (bpe *BytePairEncoding) split(s string) iter.Seq[string] {
 				r := []rune(part)
 				var offset int
 				for m, _ := re.FindRunesMatch(r); m != nil; m, _ = re.FindNextMatch(m) {
-					if offset-m.Index != 0 {
-						if !yield(string(r[offset:m.Index])) {
+					if offset-m.RuneIndex != 0 {
+						if !yield(string(r[offset:m.RuneIndex])) {
 							return
 						}
 					}
@@ -93,7 +93,7 @@ func (bpe *BytePairEncoding) split(s string) iter.Seq[string] {
 						return
 					}
 
-					offset = m.Index + m.Length
+					offset = m.RuneIndex + m.RuneLength
 				}
 
 				if offset < len(r) {
