@@ -34,7 +34,10 @@ COPY ml/backend/ggml/ggml ml/backend/ggml/ggml
 ENV LDFLAGS=-s
 
 FROM base AS cpu
-RUN dnf install -y gcc-toolset-11-gcc gcc-toolset-11-gcc-c++
+# This stage never needs CUDA packages, so skip the NVIDIA cuda-rhel8* repo
+# metadata refresh - its mirrors being flaky/unreachable shouldn't block a
+# CPU-only build (dnf refreshes every enabled repo before installing).
+RUN dnf install -y --disablerepo="cuda-rhel8*" gcc-toolset-11-gcc gcc-toolset-11-gcc-c++
 ENV PATH=/opt/rh/gcc-toolset-11/root/usr/bin:$PATH
 RUN --mount=type=cache,target=/root/.ccache \
     cmake --preset 'CPU' \
